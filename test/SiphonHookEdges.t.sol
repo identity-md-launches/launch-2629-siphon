@@ -55,6 +55,7 @@ contract SiphonHookEdgesTest is Test {
 
     PoolKey key;
     PoolId id;
+    uint256 saltCursor;
 
     address owner = makeAddr("owner");
     address factory = makeAddr("factory");
@@ -114,31 +115,42 @@ contract SiphonHookEdgesTest is Test {
 
     function deployHook(address owner_) internal returns (SiphonHook) {
         bytes32 initHash = keccak256(abi.encodePacked(type(SiphonHook).creationCode, abi.encode(manager, owner_)));
-        for (uint256 i = 0; i < 100_000; i++) {
+        // Each call resumes past the last salt used, so several hooks can share one owner.
+        for (uint256 i = saltCursor; i < saltCursor + 100_000; i++) {
             address predicted = vm.computeCreate2Address(bytes32(i), initHash, address(this));
             if (!HookFlags.matches(predicted, FLAGS)) continue;
+            saltCursor = i + 1;
             return new SiphonHook{salt: bytes32(i)}(manager, owner_);
         }
         revert("no salt found");
     }
 
-    /// @dev Opens an A/B pool on the hook with `fee`, and liquidity on [lower, upper] when nonzero.
-    function openPool(uint24 fee, int24 lower, int24 upper, uint128 liquidity) internal returns (PoolKey memory k) {
-        k = PoolKey(Currency.wrap(address(tokA)), Currency.wrap(address(tokB)), fee, SPACING, IHooks(address(hook)));
+    /// @dev Opens an A/B pool with `fee` on a hook of its own (a hook serves only its first pool), and
+    /// liquidity on [lower, upper] when nonzero.
+    function openPool(uint24 fee, int24 lower, int24 upper, uint128 liquidity)
+        internal
+        returns (PoolKey memory k, SiphonHook h)
+    {
+        h = deployHook(owner);
+        k = PoolKey(Currency.wrap(address(tokA)), Currency.wrap(address(tokB)), fee, SPACING, IHooks(address(h)));
         manager.initialize(k, SQRT_PRICE_1_1);
         if (liquidity > 0) lp.modify(k, lower, upper, int256(uint256(liquidity)));
     }
 
-    function poolDataLogs() internal view returns (Data[] memory out) {
+    function poolDataLogs() internal view returns (Data[] memory) {
+        return poolDataLogsOf(address(hook));
+    }
+
+    function poolDataLogsOf(address emitter) internal view returns (Data[] memory out) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         uint256 n;
         for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].emitter == address(hook) && logs[i].topics[0] == POOL_DATA_SIG) n++;
+            if (logs[i].emitter == emitter && logs[i].topics[0] == POOL_DATA_SIG) n++;
         }
         out = new Data[](n);
         uint256 j;
         for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].emitter != address(hook) || logs[i].topics[0] != POOL_DATA_SIG) continue;
+            if (logs[i].emitter != emitter || logs[i].topics[0] != POOL_DATA_SIG) continue;
             Data memory d = out[j++];
             d.blockNumber = uint256(logs[i].topics[1]);
             (
@@ -155,7 +167,11 @@ contract SiphonHookEdgesTest is Test {
     }
 
     function onlyPoolData() internal view returns (Data memory) {
-        Data[] memory all = poolDataLogs();
+        return onlyPoolDataOf(address(hook));
+    }
+
+    function onlyPoolDataOf(address emitter) internal view returns (Data memory) {
+        Data[] memory all = poolDataLogsOf(emitter);
         assertEq(all.length, 1, "exactly one PoolData per swap");
         return all[0];
     }
@@ -202,11 +218,11 @@ contract SiphonHookEdgesTest is Test {
     }
 
     function test_swapLeavingTheLiquidityRangeReportsZeroLiquidity() public {
-        PoolKey memory k = openPool(3000, -600, 600, 1e20);
+        (PoolKey memory k, SiphonHook h) = openPool(3000, -600, 600, 1e20);
         uint160 limit = TickMath.getSqrtPriceAtTick(-1200);
         vm.recordLogs();
         BalanceDelta delta = limitSwapper.swap(k, SwapParams(true, -1e30, limit), "");
-        Data memory d = onlyPoolData();
+        Data memory d = onlyPoolDataOf(address(h));
 
         assertEq(d.liquidity, 0, "price left the only position");
         assertEq(d.sqrtPriceSelf, limit);
@@ -216,10 +232,10 @@ contract SiphonHookEdgesTest is Test {
     }
 
     function test_maximumLpFeeReportsTheWholeInputAsFee() public {
-        PoolKey memory k = openPool(uint24(LPFeeLibrary.MAX_LP_FEE), -600, 600, 1e20);
+        (PoolKey memory k, SiphonHook h) = openPool(uint24(LPFeeLibrary.MAX_LP_FEE), -600, 600, 1e20);
         vm.recordLogs();
         BalanceDelta delta = limitSwapper.swap(k, SwapParams(true, -1 ether, TickMath.MIN_SQRT_PRICE + 1), "");
-        Data memory d = onlyPoolData();
+        Data memory d = onlyPoolDataOf(address(h));
         assertEq(paidOf(delta, true), 1 ether);
         assertEq(delta.amount1(), 0, "a 100% fee pays nothing out");
         assertEq(d.feeAmount, 1 ether, "the whole input is fee");
@@ -227,19 +243,11 @@ contract SiphonHookEdgesTest is Test {
     }
 
     function test_dynamicFeePoolWithNoFeeSetReportsZeroFee() public {
-        PoolKey memory k = PoolKey(
-            Currency.wrap(address(tokA)),
-            Currency.wrap(address(tokB)),
-            LPFeeLibrary.DYNAMIC_FEE_FLAG,
-            SPACING,
-            IHooks(address(hook))
-        );
-        manager.initialize(k, SQRT_PRICE_1_1);
-        lp.modify(k, -600, 600, 1e20);
+        (PoolKey memory k, SiphonHook h) = openPool(LPFeeLibrary.DYNAMIC_FEE_FLAG, -600, 600, 1e20);
         uint256 before = feeGrowth(k.toId(), true);
         vm.recordLogs();
         limitSwapper.swap(k, SwapParams(true, -1 ether, TickMath.MIN_SQRT_PRICE + 1), "");
-        Data memory d = onlyPoolData();
+        Data memory d = onlyPoolDataOf(address(h));
         assertEq(d.feeAmount, 0, "the hook never sets a dynamic fee, so none is charged");
         assertEq(feeGrowth(k.toId(), true), before, "and the pool charged none");
     }
@@ -307,25 +315,30 @@ contract SiphonHookEdgesTest is Test {
         assertEq(poolDataLogs().length, 0);
     }
 
-    function test_eachPoolDataFollowsTheManagersSwapEventForItsPool() public {
-        // PoolData carries no pool id; the manager's Swap event for the same swap is the log just
-        // before it, which is how a consumer attributes a record to a pool.
-        PoolKey memory other = openPool(3000, -600, 600, 1e20);
+    function test_eachPoolDataFollowsTheManagersSwapEventForItsHooksPool() public {
+        // PoolData carries no pool id; the emitting hook's `poolId()` names the pool, and the
+        // manager's Swap event for that pool is the log just before every record.
+        (PoolKey memory other, SiphonHook h) = openPool(3000, -600, 600, 1e20);
         vm.recordLogs();
         swapper.swap(key, true, 1 ether);
         limitSwapper.swap(other, SwapParams(true, -1 ether, TickMath.MIN_SQRT_PRICE + 1), "");
+        swapper.swap(key, false, 1 ether);
         Vm.Log[] memory logs = vm.getRecordedLogs();
-        bytes32[2] memory expected = [PoolId.unwrap(id), PoolId.unwrap(other.toId())];
         uint256 seen;
         for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].emitter != address(hook) || logs[i].topics[0] != POOL_DATA_SIG) continue;
+            if (logs[i].topics.length == 0 || logs[i].topics[0] != POOL_DATA_SIG) continue;
+            address emitter = logs[i].emitter;
+            assertTrue(emitter == address(hook) || emitter == address(h), "only the two hooks emit PoolData");
             assertGt(i, 0);
             Vm.Log memory prev = logs[i - 1];
             assertEq(prev.emitter, address(manager), "previous log is the manager's");
             assertEq(prev.topics[0], SWAP_SIG, "and it is Swap");
-            assertEq(prev.topics[1], expected[seen++], "for the pool this record describes");
+            assertEq(prev.topics[1], SiphonHook(emitter).poolId(), "for the pool the emitting hook serves");
+            seen++;
         }
-        assertEq(seen, 2);
+        assertEq(seen, 3);
+        assertEq(hook.poolId(), PoolId.unwrap(id));
+        assertEq(h.poolId(), PoolId.unwrap(other.toId()));
     }
 
     // ───────────────────────────── hostile anchors ─────────────────────────────
@@ -382,8 +395,8 @@ contract SiphonHookEdgesTest is Test {
     }
 
     function test_gasBurningAnchorReadsAsZeroAndClearingItRestoresTheCost() public {
-        // With ample gas the swap survives an anchor that burns everything it is given (see the
-        // reported finding for what happens at a realistic gas limit).
+        // The swap survives an anchor that burns everything it is given; the 50k stipend bounds what
+        // it costs (SiphonHook.t.sol checks that at a 300k swap gas limit).
         GasBurningAnchor burner = new GasBurningAnchor();
         setAnchor(address(burner), bytes32(uint256(1)));
         vm.recordLogs();
@@ -503,13 +516,105 @@ contract SiphonHookEdgesTest is Test {
     }
 
     function test_beforeInitializeAcceptsThePolicyFeeFromTheManagerOnly() public {
+        SiphonHook fresh = deployHook(owner);
         PoolKey memory k =
-            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(token)), FEE, 200, IHooks(address(hook)));
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(token)), FEE, 200, IHooks(address(fresh)));
         vm.prank(stranger);
         vm.expectRevert(SiphonHook.NotPoolManager.selector);
-        hook.beforeInitialize(stranger, k, SQRT_PRICE_1_1);
+        fresh.beforeInitialize(stranger, k, SQRT_PRICE_1_1);
+        assertEq(fresh.poolId(), bytes32(0), "a refused caller records nothing");
         vm.prank(address(manager));
-        assertEq(hook.beforeInitialize(factory, k, TickMath.MIN_SQRT_PRICE), IHooks.beforeInitialize.selector);
+        assertEq(fresh.beforeInitialize(factory, k, TickMath.MIN_SQRT_PRICE), IHooks.beforeInitialize.selector);
+        assertEq(fresh.poolId(), PoolId.unwrap(k.toId()));
+
+        // The launch hook already serves its pool, so even the manager is refused on it now.
+        vm.prank(address(manager));
+        vm.expectRevert(SiphonHook.PoolAlreadyInitialized.selector);
+        hook.beforeInitialize(factory, k, SQRT_PRICE_1_1);
+    }
+
+    // ───────────────────────────── one pool per hook ─────────────────────────────
+
+    /// forge-config: default.fuzz.runs = 500
+    function testFuzz_beforeInitializeRecordsExactlyThePoolIdOfTheKeyGiven(
+        address c0,
+        address c1,
+        uint24 fee,
+        int24 spacing,
+        uint160 price,
+        bytes32 hookWord
+    ) public {
+        SiphonHook fresh = deployHook(owner);
+        // The hook hashes the key as it sits in calldata; any key, sane or not, must give its own id.
+        PoolKey memory k =
+            PoolKey(Currency.wrap(c0), Currency.wrap(c1), fee, spacing, IHooks(address(uint160(uint256(hookWord)))));
+        vm.prank(address(manager));
+        fresh.beforeInitialize(stranger, k, price);
+        assertEq(fresh.poolId(), keccak256(abi.encode(k)));
+        assertEq(fresh.poolId(), PoolId.unwrap(k.toId()));
+    }
+
+    /// forge-config: default.fuzz.runs = 300
+    function testFuzz_nobodyOpensASecondPoolOnTheLaunchHook(uint256 callerSeed, uint24 fee, int24 spacing) public {
+        // Any caller, any fee, any spacing, against both currency pairs: the manager accepts the key,
+        // the hook refuses it, the recorded pool and its records are untouched.
+        address[3] memory callers = [stranger, factory, owner];
+        address caller = callers[callerSeed % 3];
+        fee = uint24(bound(fee, 0, LPFeeLibrary.MAX_LP_FEE));
+        spacing = int24(bound(spacing, 1, TickMath.MAX_TICK_SPACING));
+        PoolKey memory k = callerSeed % 2 == 0
+            ? PoolKey(Currency.wrap(address(0)), Currency.wrap(address(token)), fee, spacing, IHooks(address(hook)))
+            : PoolKey(Currency.wrap(address(tokA)), Currency.wrap(address(tokB)), fee, spacing, IHooks(address(hook)));
+        vm.assume(PoolId.unwrap(k.toId()) != PoolId.unwrap(id));
+        vm.prank(caller);
+        vm.expectRevert();
+        manager.initialize(k, SQRT_PRICE_1_1);
+        (uint160 p,,,) = manager.getSlot0(k.toId());
+        assertEq(p, 0, "the second pool does not exist");
+        assertEq(hook.poolId(), PoolId.unwrap(id), "the launch pool is still the one served");
+
+        vm.recordLogs();
+        swapper.swap(key, true, 1 ether);
+        assertSelfState(onlyPoolData(), id);
+    }
+
+    function test_reinitializingTheLaunchPoolIsRefusedAndChangesNothing() public {
+        vm.prank(factory);
+        vm.expectRevert();
+        manager.initialize(key, SQRT_PRICE_1_1 / 2);
+        (uint160 p,,,) = manager.getSlot0(id);
+        assertEq(p, SQRT_PRICE_1_1);
+        assertEq(hook.poolId(), PoolId.unwrap(id));
+    }
+
+    function test_unitAfterSwapWithAForeignKeyStillDescribesTheRecordedPool() public {
+        // Only the manager can call afterSwap, and only for a pool naming this hook; still, a key that
+        // is not the recorded pool's never redirects the read.
+        PoolKey memory foreign =
+            PoolKey(Currency.wrap(address(tokA)), Currency.wrap(address(tokB)), 3000, SPACING, IHooks(address(0)));
+        manager.initialize(foreign, TickMath.getSqrtPriceAtTick(7000));
+        vm.recordLogs();
+        vm.prank(address(manager));
+        hook.afterSwap(stranger, foreign, SwapParams(true, -1, 0), toBalanceDelta(-1e6, 1), "");
+        Data memory d = onlyPoolData();
+        assertSelfState(d, id);
+        assertEq(d.feeAmount, 1e6 * uint256(FEE) / 1_000_000, "the recorded pool's fee, not the foreign key's");
+    }
+
+    function test_unitAfterSwapBeforeAnyPoolReadsAnEmptyPool() public {
+        // A hook with no pool yet cannot be swapped through; if the manager called it anyway it would
+        // describe the zero id, which holds nothing, and still return cleanly.
+        SiphonHook fresh = deployHook(owner);
+        vm.recordLogs();
+        vm.prank(address(manager));
+        (bytes4 selector, int128 hookDelta) =
+            fresh.afterSwap(stranger, key, SwapParams(true, -1, 0), toBalanceDelta(-1, 1), "");
+        assertEq(selector, IHooks.afterSwap.selector);
+        assertEq(hookDelta, 0);
+        Data memory d = onlyPoolDataOf(address(fresh));
+        assertEq(d.sqrtPriceSelf, 0);
+        assertEq(d.liquidity, 0);
+        assertEq(d.feeAmount, 0);
     }
 
     function test_swapsAcrossBlocksCarryTheirOwnBlockNumber() public {

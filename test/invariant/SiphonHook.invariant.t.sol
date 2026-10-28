@@ -57,6 +57,7 @@ contract SiphonHandler is Test {
     uint256 public records;
     uint256 public mismatches;
     string public lastMismatch;
+    uint256 public secondPoolAttempts;
 
     constructor(
         IPoolManager manager_,
@@ -241,6 +242,24 @@ contract SiphonHandler is Test {
         }
     }
 
+    /// @dev Anyone, the factory included, opening another pool on the hook must be refused: the hook
+    /// serves its first pool only, so the manager never creates the pool.
+    function openAnotherPool(uint256 callerSeed, uint24 fee, int24 spacing, uint160 price) external {
+        address caller = _actor(callerSeed);
+        fee = uint24(bound(fee, 0, 1_000_000));
+        spacing = int24(bound(spacing, 1, TickMath.MAX_TICK_SPACING));
+        price = uint160(bound(price, TickMath.MIN_SQRT_PRICE, TickMath.MAX_SQRT_PRICE - 1));
+        PoolKey memory k = PoolKey(key.currency0, key.currency1, fee, spacing, key.hooks);
+        if (PoolId.unwrap(k.toId()) == PoolId.unwrap(id)) return;
+        secondPoolAttempts++;
+        vm.prank(caller);
+        try manager.initialize(k, price) {
+            _mismatch("a second pool opened on the hook");
+        } catch {}
+        (uint160 p,,,) = manager.getSlot0(k.toId());
+        if (p != 0) _mismatch("a second pool exists");
+    }
+
     /// @dev Anyone but the manager calling a callback directly must be refused and change nothing.
     function pokeCallback(uint256 callerSeed) external {
         address caller = _actor(callerSeed);
@@ -360,6 +379,12 @@ contract SiphonInvariantTest is Test {
         assertEq(hook.anchor(), handler.ghostAnchor(), "anchor");
         assertEq(hook.anchorPoolId(), handler.ghostAnchorPoolId(), "anchor pool id");
         assertEq(address(hook.poolManager()), address(manager), "manager is immutable");
+    }
+
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 40
+    function invariant_theHookServesTheLaunchPoolForever() public view {
+        assertEq(hook.poolId(), PoolId.unwrap(key.toId()), "recorded pool never changes");
     }
 
     /// forge-config: default.invariant.runs = 256
