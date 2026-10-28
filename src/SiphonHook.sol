@@ -32,8 +32,16 @@ contract SiphonHook {
     address public anchor;
     /// @notice The anchor pool's id, passed to `getSlot0`.
     bytes32 public anchorPoolId;
+    /// @notice The one pool this hook serves: the first opened on it. The launch factory deploys the
+    /// hook and opens the launch pool in one transaction, so that pool is always the first; every
+    /// later `initialize` naming this hook is refused, so no other pool can make it emit `PoolData`.
+    bytes32 public poolId;
 
-    /// @notice One record per swap in a pool using this hook.
+    /// @dev Gas forwarded to the anchor's `getSlot0`. A `StateView` read costs well under 10k; the
+    /// cap stops an anchor that burns its gas from taking 63/64 of the swap's.
+    uint256 private constant ANCHOR_GAS = 50_000;
+
+    /// @notice One record per swap in this hook's pool (`poolId`), the only pool it serves.
     /// @param blockNumber `block.number` at the swap. On Arbitrum Nitro chains such as Robinhood
     /// Chain this is the L1 block number the sequencer observed, not the L2 block.
     /// @param sqrtPriceSelf This pool's sqrtPriceX96 after the swap.
@@ -42,7 +50,8 @@ contract SiphonHook {
     /// @param tickAnchor The anchor pool's tick, or zero under the same conditions.
     /// @param swapAmount `amountSpecified` of the swap: negative for exact input, positive for exact output.
     /// @param zeroForOne The swap's direction.
-    /// @param feeAmount Estimated LP fee paid: the input actually taken times the pool's LP fee over 1e6.
+    /// @param feeAmount Nominal LP fee: the input actually taken times the pool's LP fee over 1e6. It
+    /// ignores any protocol fee the PoolManager's owner sets (at most 0.1% per direction).
     /// @param liquidity This pool's in-range liquidity after the swap.
     event PoolData(
         uint256 indexed blockNumber,
@@ -62,6 +71,7 @@ contract SiphonHook {
     error NotPoolManager();
     error NotOwner();
     error ZeroAddress();
+    error PoolAlreadyInitialized();
 
     /// @param poolManager_ The chain's Uniswap v4 PoolManager (manifest: "$poolManager").
     /// @param owner_ The administrator (manifest: "$owner"). Never the deploying factory.
@@ -142,28 +152,34 @@ contract SiphonHook {
         });
     }
 
-    /// @notice Accepts any pool opened on this hook. Present so the pool cannot be initialized
-    /// before the hook exists; it imposes no fee or spacing rule.
-    function beforeInitialize(address, PoolKey calldata, uint160) external view onlyPoolManager returns (bytes4) {
+    /// @notice Accepts the first pool opened on this hook and records its id; refuses every later one.
+    /// Present so the pool cannot be initialized before the hook exists, and so nobody can open a
+    /// second pool whose swaps would emit `PoolData` from this address. Imposes no fee or spacing rule.
+    /// @dev The pool id is `keccak256(abi.encode(key))`. The key is a static tuple that sits in
+    /// calldata at offset 36 (selector, then `sender`), so hashing those 160 bytes in place is the
+    /// same id without copying the struct to memory; that copy alone costs over fifty bytes of code.
+    function beforeInitialize(address, PoolKey calldata, uint160) external onlyPoolManager returns (bytes4) {
+        if (poolId != 0) revert PoolAlreadyInitialized();
+        bytes32 id;
+        assembly ("memory-safe") {
+            let p := mload(0x40)
+            calldatacopy(p, 36, 160)
+            id := keccak256(p, 160)
+        }
+        poolId = id;
         return IHooks.beforeInitialize.selector;
     }
 
     /// @notice Reads this pool and the anchor, emits `PoolData`, returns no delta.
-    /// @dev The pool id is `keccak256(abi.encode(key))`. The key is a static tuple that sits in
-    /// calldata at offset 36 (selector, then `sender`), so hashing those 160 bytes in place is the
-    /// same id without copying the struct to memory; that copy alone costs over fifty bytes of code.
+    /// @dev The PoolManager calls this only for initialized pools naming this hook, and
+    /// `beforeInitialize` lets exactly one exist, so the stored `poolId` is the swapped pool's.
     function afterSwap(address, PoolKey calldata, SwapParams calldata params, BalanceDelta delta, bytes calldata)
         external
         onlyPoolManager
         returns (bytes4, int128)
     {
         if (!paused) {
-            PoolId id;
-            assembly ("memory-safe") {
-                let p := mload(0x40)
-                calldatacopy(p, 36, 160)
-                id := keccak256(p, 160)
-            }
+            PoolId id = PoolId.wrap(poolId);
             (uint160 sqrtPriceSelf, int24 tickSelf,, uint24 lpFee) = poolManager.getSlot0(id);
             uint128 liquidity = poolManager.getLiquidity(id);
 
@@ -195,7 +211,8 @@ contract SiphonHook {
     }
 
     /// @dev `staticcall anchor.getSlot0(anchorPoolId)`. Returns zeros while unset, or when the call
-    /// fails or answers fewer than two words, so a misconfigured anchor can never block a swap.
+    /// fails or answers fewer than two words, so a misconfigured anchor can never block a swap. The
+    /// call gets at most `ANCHOR_GAS`, so an anchor that burns gas costs a swap at most that much.
     function _readAnchor() private view returns (uint160 sqrtPriceAnchor, int24 tickAnchor) {
         address target = anchor;
         if (target == address(0)) return (0, 0);
@@ -205,7 +222,7 @@ contract SiphonHook {
             // getSlot0(bytes32) selector, left-aligned
             mstore(p, 0xc815641c00000000000000000000000000000000000000000000000000000000)
             mstore(add(p, 4), poolId)
-            let ok := staticcall(gas(), target, p, 36, p, 64)
+            let ok := staticcall(ANCHOR_GAS, target, p, 36, p, 64)
             if and(ok, gt(returndatasize(), 63)) {
                 sqrtPriceAnchor := and(mload(p), 0xffffffffffffffffffffffffffffffffffffffff)
                 tickAnchor := signextend(2, mload(add(p, 32)))

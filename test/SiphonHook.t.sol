@@ -19,7 +19,8 @@ import {HookFlags} from "../src/HookFlags.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {Swapper} from "./mocks/Swapper.sol";
 import {LiquidityRouter} from "./mocks/LiquidityRouter.sol";
-import {AnchorView, RevertingAnchor, FixedAnchor, ShortAnchor} from "./mocks/AnchorView.sol";
+import {AnchorView, RevertingAnchor, FixedAnchor, ShortAnchor, GasBurningAnchor} from "./mocks/AnchorView.sol";
+import {DustSwapper} from "./mocks/DustSwapper.sol";
 
 contract SiphonHookTest is Test {
     using StateLibrary for IPoolManager;
@@ -169,6 +170,7 @@ contract SiphonHookTest is Test {
         assertEq(hook.anchor(), address(0));
         assertEq(hook.anchorPoolId(), bytes32(0));
         assertFalse(hook.paused());
+        assertEq(hook.poolId(), PoolId.unwrap(id), "the factory's pool is recorded as the hook's pool");
         assertTrue(hook.owner() != factory && hook.owner() != address(this));
     }
 
@@ -228,12 +230,25 @@ contract SiphonHookTest is Test {
         hook.afterSwap(owner, key, SwapParams(true, -1 ether, 0), toBalanceDelta(-1, 1), "");
     }
 
-    function test_beforeInitializeReturnsItsSelector() public {
+    function test_beforeInitializeReturnsItsSelectorAndRecordsTheFirstPoolOnly() public {
+        SiphonHook fresh = deployHook(makeAddr("other owner"));
+        assertEq(fresh.poolId(), bytes32(0), "no pool before initialize");
+
         vm.prank(address(manager));
-        assertEq(hook.beforeInitialize(factory, key, SQRT_PRICE_1_1), IHooks.beforeInitialize.selector);
+        assertEq(fresh.beforeInitialize(factory, key, SQRT_PRICE_1_1), IHooks.beforeInitialize.selector);
+        assertEq(fresh.poolId(), keccak256(abi.encode(key)), "the id is keccak256(abi.encode(key))");
+
+        // Any second pool, even the same key again, is refused.
+        vm.prank(address(manager));
+        vm.expectRevert(SiphonHook.PoolAlreadyInitialized.selector);
+        fresh.beforeInitialize(factory, anchorKey, SQRT_PRICE_1_1);
+        vm.prank(address(manager));
+        vm.expectRevert(SiphonHook.PoolAlreadyInitialized.selector);
+        fresh.beforeInitialize(factory, key, SQRT_PRICE_1_1);
+        assertEq(fresh.poolId(), keccak256(abi.encode(key)), "unchanged");
     }
 
-    function test_anyoneCanOpenAnotherPoolOnTheHook() public {
+    function test_nobodyCanOpenAnotherPoolOnTheHook() public {
         PoolKey memory other = PoolKey({
             currency0: Currency.wrap(address(0)),
             currency1: Currency.wrap(address(token)),
@@ -242,9 +257,37 @@ contract SiphonHookTest is Test {
             hooks: IHooks(address(hook))
         });
         vm.prank(stranger);
+        vm.expectRevert();
         manager.initialize(other, SQRT_PRICE_1_1);
+
+        // Not the factory either: the hook serves exactly one pool.
+        vm.prank(factory);
+        vm.expectRevert();
+        manager.initialize(other, SQRT_PRICE_1_1);
+
         (uint160 sqrtPrice,,,) = manager.getSlot0(other.toId());
-        assertEq(sqrtPrice, SQRT_PRICE_1_1);
+        assertEq(sqrtPrice, 0, "the second pool was never opened");
+        assertEq(hook.poolId(), PoolId.unwrap(id));
+    }
+
+    function test_strangerCannotForgePoolDataThroughAnEmptyPool() public {
+        // A liquidity-less pool would let a swap walk the price anywhere for free; it cannot be opened.
+        PoolKey memory forged = PoolKey({
+            currency0: Currency.wrap(address(0)),
+            currency1: Currency.wrap(address(token)),
+            fee: 3000,
+            tickSpacing: 10,
+            hooks: IHooks(address(hook))
+        });
+        vm.startPrank(stranger);
+        DustSwapper dust = new DustSwapper(manager);
+        vm.expectRevert();
+        manager.initialize(forged, TickMath.getSqrtPriceAtTick(-887_000));
+        vm.recordLogs();
+        vm.expectRevert();
+        dust.swap(forged, false, -1, TickMath.getSqrtPriceAtTick(-886_900));
+        vm.stopPrank();
+        assertEq(poolDataLogs().length, 0, "no PoolData for a pool the hook does not serve");
     }
 
     function test_setAnchorOnlyOwner() public {
@@ -423,6 +466,27 @@ contract SiphonHookTest is Test {
         assertSelfState(d);
     }
 
+    function test_anchorThatBurnsItsGasCostsTheSwapAtMostTheStipend() public {
+        // Baseline: what an ordinary swap costs with no anchor.
+        uint256 g = gasleft();
+        swapper.swap(key, true, 1 ether);
+        uint256 baseline = g - gasleft();
+
+        GasBurningAnchor burner = new GasBurningAnchor();
+        vm.prank(owner);
+        hook.setAnchor(address(burner), PoolId.unwrap(anchorId));
+
+        vm.recordLogs();
+        g = gasleft();
+        swapper.swap{gas: 300_000}(key, true, 1 ether);
+        uint256 used = g - gasleft();
+        Data memory d = onlyPoolData();
+        assertEq(d.sqrtPriceAnchor, 0);
+        assertEq(d.tickAnchor, 0);
+        assertSelfState(d);
+        assertLt(used, baseline + 60_000, "the anchor consumed more than its stipend");
+    }
+
     function test_anchorWithShortAnswerReadsAsZero() public {
         ShortAnchor short = new ShortAnchor();
         vm.prank(owner);
@@ -509,17 +573,15 @@ contract SiphonHookTest is Test {
         assertEq(onlyPoolData().feeAmount, 0);
     }
 
-    function test_afterSwapHashesTheKeyItWasGiven() public {
-        // The pool id is derived from the calldata key: a different key reads a different pool.
+    function test_afterSwapReadsTheRecordedPool() public {
+        // The pool read is the one recorded at initialization, never one named by the key passed in.
         vm.recordLogs();
         vm.prank(address(manager));
-        hook.afterSwap(address(swapper), anchorKey, SwapParams(true, -1, 0), toBalanceDelta(-1, 0), "");
+        hook.afterSwap(address(swapper), anchorKey, SwapParams(true, -1_000_000, 0), toBalanceDelta(-1_000_000, 0), "");
         Data memory d = onlyPoolData();
-        (uint160 anchorPrice, int24 anchorTick,, uint24 lpFee) = manager.getSlot0(anchorId);
-        assertEq(d.sqrtPriceSelf, anchorPrice);
-        assertEq(d.tickSelf, anchorTick);
-        assertEq(d.liquidity, 0, "the anchor pool has no liquidity");
-        assertEq(d.feeAmount, 1 * uint256(lpFee) / 1_000_000);
+        assertSelfState(d);
+        assertEq(d.liquidity, LIQUIDITY, "the launch pool's liquidity, not the anchor pool's zero");
+        assertEq(d.feeAmount, 12_500, "the launch pool's LP fee");
     }
 
     // ───────────────────────────── no fee, no delta, no custody ─────────────────────────────

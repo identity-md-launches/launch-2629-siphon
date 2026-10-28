@@ -57,3 +57,12 @@ contract ShortAnchor {
         }
     }
 }
+
+/// @notice An anchor that halts exceptionally, consuming every unit of gas it is given.
+contract GasBurningAnchor {
+    fallback() external {
+        assembly {
+            invalid()
+        }
+    }
+}

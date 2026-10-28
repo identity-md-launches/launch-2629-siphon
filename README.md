@@ -5,14 +5,19 @@ Two contracts, built for an IMD hook launch on Robinhood Chain (chain id 4663):
 | Contract | File | What it is |
 | --- | --- | --- |
 | `SiphonToken` | `src/SiphonToken.sol` | The launch token. Name `SIPHON`, symbol `SIPH`, 18 decimals, 1,000,000,000 tokens (10^27 minor units) minted once to the deployer. No owner, mint, pause, blocklist, fee or upgrade. |
-| `SiphonHook` | `src/SiphonHook.sol` | The pool's hook. `afterSwap` reads the pool and an optional anchor pool and emits one `PoolData` event per swap. No fee, no return delta, no transient storage, no swap execution, no custody. Runtime is 1960 bytes, under the 2 KB budget. |
+| `SiphonHook` | `src/SiphonHook.sol` | The pool's hook. `afterSwap` reads the pool and an optional anchor pool and emits one `PoolData` event per swap. No fee, no return delta, no transient storage, no swap execution, no custody. Runtime is 2030 bytes, under the 2 KB budget. |
 
 `src/HookFlags.sol` is an internal library mapping permission bits to addresses; the floor tests and the
 deploy script use it.
 
 ## What the hook does
 
-On every swap in a pool that names it, after the swap has executed:
+The hook serves exactly one pool: the first one initialized on it, whose id it records in `poolId`.
+The launch factory deploys the hook and opens the launch pool in the same transaction, so that pool is
+always the launch pool. Every later `initialize` naming the hook is refused (`PoolAlreadyInitialized`),
+so no other pool can make the hook emit `PoolData`.
+
+On every swap in that pool, after the swap has executed:
 
 1. If `paused` is set, return immediately. Nothing is read or emitted. The swap itself is never
    blocked by this hook.
@@ -21,7 +26,9 @@ On every swap in a pool that names it, after the swap has executed:
 3. If `anchor != address(0)`: `staticcall anchor.getSlot0(anchorPoolId)`, selector `0xc815641c`, and
    take the first two return words as the anchor's `sqrtPriceX96` and `tick`. If the call fails,
    returns fewer than two words, or the anchor has no code, both values are reported as zero and the
-   swap proceeds. A misconfigured anchor can never halt trading.
+   swap proceeds. The call is given at most 50,000 gas (`ANCHOR_GAS`; a `StateView` read costs well
+   under 10k), so an anchor that reverts, loops or burns its gas costs a swap at most that much and
+   cannot halt trading at ordinary gas limits.
 4. Emit:
 
 ```solidity
@@ -33,7 +40,7 @@ event PoolData(
     int24   tickAnchor,          // 0 under the same conditions
     int256  swapAmount,          // params.amountSpecified: negative = exact input, positive = exact output
     bool    zeroForOne,          // params.zeroForOne
-    uint256 feeAmount,           // input actually paid (from the swap's BalanceDelta) * lpFee / 1e6
+    uint256 feeAmount,           // nominal LP fee: input actually paid (from the BalanceDelta) * lpFee / 1e6
     uint128 liquidity            // this pool's in-range liquidity after the swap
 );
 ```
@@ -46,7 +53,11 @@ event PoolData(
   input from exact output. The amount actually paid is recoverable from `feeAmount` and the pool's fee.
 - **`feeAmount`** is an estimate of the LP fee: the input the swapper actually paid (the negative side
   of its `BalanceDelta`) times the pool's LP fee over 1e6. It is not read from the pool's fee growth
-  accumulators; it matches v4's per-step fee to within rounding for single-step swaps.
+  accumulators. While the PoolManager's protocol fee is zero it matches v4's per-step fee to within
+  rounding for single-step swaps. If the PoolManager's owner sets a protocol fee (at most 1000 pips,
+  0.1%, per direction), v4 charges `protocolFee + lpFee - protocolFee * lpFee / 1e6` and credits LPs
+  the LP share net of the protocol's cut, so `feeAmount` then slightly overstates the LP fee credited
+  and understates the total fee paid, by at most about 0.1% of the input.
 - **`blockNumber`** is `block.number`. Robinhood Chain runs Arbitrum Nitro, where `block.number`
   is the L1 block number the sequencer observed, not the L2 block. Consumers that need wall time
   should read the block's timestamp from the receipt.
@@ -62,9 +73,14 @@ event PoolData(
 
 The brief asks for `afterSwap` only. IMD launches additionally require an initialization callback, so
 nobody can initialize the predicted pool while the hook has no code. `beforeInitialize` is enabled and
-implemented: it checks the caller is the PoolManager and returns its selector. It imposes no fee, spacing
-or currency rule, so the factory opens the launch pool (ETH / SIPH, fee 12500, spacing 60) without
-restriction, and so can anyone open other pools on this hook; those pools simply emit `PoolData` too.
+implemented: it checks the caller is the PoolManager, records the pool's id in `poolId` if none is
+recorded yet, reverts with `PoolAlreadyInitialized` otherwise, and returns its selector. It imposes no
+fee, spacing or currency rule, so the factory opens the launch pool (ETH / SIPH, fee 12500, spacing 60)
+without restriction. Nobody, the factory included, can open a second pool on the hook: before this
+rule any account could open a liquidity-less pool on the hook and swap it for free to make the hook
+emit `PoolData` carrying a price of its choosing, indistinguishable from the launch pool's records.
+Because the hook and its pool are created in one transaction, nobody can open a pool on the hook
+first; and the hook address has no code before that transaction, so `initialize` on it reverts.
 
 No liquidity callbacks exist, so the factory's fee collect (a zero liquidity change, which v4 routes
 through the remove-liquidity path) is untouched by the hook. `test_factoryCollectsFeesWithAZeroLiquidityChange`
@@ -116,8 +132,9 @@ Three deliberate choices keep the runtime under 2 KB; each is commented in the s
 - `getHookPermissions()` ABI-encodes its fourteen booleans in assembly (448 zero bytes with word 0
   and word 7 set to one) instead of building the struct. The constructor's self-check uses an ordinary
   struct built by `_permissions()`, which only exists in creation code.
-- `afterSwap` hashes the `PoolKey` where it sits in calldata (offset 36, 160 bytes) instead of copying
-  it to memory; `keccak256(abi.encode(key))` is by definition the pool id.
+- `beforeInitialize` hashes the `PoolKey` where it sits in calldata (offset 36, 160 bytes) instead of
+  copying it to memory; `keccak256(abi.encode(key))` is by definition the pool id. `afterSwap` reads
+  the recorded `poolId`, which is the only pool that can call it.
 - The anchor read is a hand-written `staticcall` with a fixed 64-byte return area. It uses `and` and
   `signextend`, never Yul shifts.
 
@@ -148,7 +165,7 @@ Do not write `launch.json`; the manifest step does, after acceptance.
 | --- | --- | --- | --- |
 | Anchor | `setAnchor(address anchor, bytes32 poolId)` | The chain's Uniswap v4 `StateView` address and the v4 pool id (`keccak256(abi.encode(PoolKey))`) of the pool to track. Pass `(address(0), 0)` to stop reading an anchor. | Uniswap's deployment list for Robinhood Chain (StateView), and the tracked pool's key from its initialize event or any v4 explorer. |
 | Pause | `setPaused(bool)` | `true` to silence `PoolData`, `false` to resume. | Operational decision. |
-| Owner | `transferOwnership(address)` | A multisig is recommended once the data pipeline is stable. | — |
+| Owner | `transferOwnership(address)` | A multisig is recommended once the data pipeline is stable. Single-step: double-check the address. | — |
 
 Until `setAnchor` is called the hook emits `PoolData` with zero anchor fields; nothing else is gated on it
 and nothing reverts for lack of it. Every setter emits an event (`AnchorSet`, `PausedSet`,
@@ -163,11 +180,21 @@ track, and the hook behaves correctly either way (both states are tested).
   cannot block swaps, take fees, move funds, change the pool's fee or upgrade the code. The pause is a
   data switch only.
 - **Anchor trust**: the owner chooses the anchor contract. A dishonest or broken anchor can only
-  make the anchor fields wrong or zero; it cannot revert swaps or touch funds. It is given all
-  remaining gas for a `staticcall`, so a pathological anchor can make swaps expensive until the owner
-  clears it. Prefer Uniswap's own `StateView`.
+  make the anchor fields wrong or zero; it cannot revert swaps or touch funds. Its `staticcall` gets
+  at most 50,000 gas, so a pathological anchor adds at most that to each swap's cost until the owner
+  clears it. Prefer Uniswap's own `StateView`, and never an anchor whose code a third party can change.
 - **Data consumers**: `PoolData` is emitted inside the swap transaction. Indexers should key on
-  `(transactionHash, logIndex)`; `blockNumber` is the Arbitrum-style L1 block number, see above.
+  `(transactionHash, logIndex)`; `blockNumber` is the Arbitrum-style L1 block number, see above. Every
+  `PoolData` from the hook's address describes the pool whose id is `poolId()`.
+- **Not a price oracle**: `sqrtPriceSelf` and `sqrtPriceAnchor` are spot values read inside the swap's
+  transaction. Anyone with capital can, in one transaction, move the anchor pool, make a dust swap in
+  the launch pool so a record carries the displaced prices, and move the anchor back. A single record
+  is a raw per-swap observation; consumers that price SIPH from this feed must aggregate across blocks
+  (time-weighted, outlier-filtered) themselves.
+- **Ownership transfer is single-step**: `transferOwnership` takes effect at once, with only a zero
+  check. A transfer to an address nobody controls fixes the anchor and pause settings forever (swaps
+  and fee collection are unaffected). Verify the new owner address before sending, prefer a multisig,
+  and consider a test call from it first. A two-step accept was left out for the 2 KB budget.
 - **Nothing to fund or withdraw**: the hook never holds ETH, tokens or ERC-6909 claims, and has no
   `receive`/`fallback`.
 - **Gas**: `afterSwap` costs roughly 10k gas (two `extsload`s, one `LOG2` with eight data words) plus the
@@ -206,14 +233,17 @@ forge fmt --check
 
 ### Test coverage
 
-`test/SiphonHook.t.sol` (37 tests): constructor state and zero-owner refusal, address/permission
-agreement, runtime size under 2 KB, opcode scan, callbacks refusing non-manager callers, owner-only
+`test/SiphonHook.t.sol` (39 tests): constructor state and zero-owner refusal, address/permission
+agreement, runtime size under 2 KB, opcode scan, callbacks refusing non-manager callers, first-pool-only
+initialization (no second pool on the hook, from a stranger or the factory, and no forged `PoolData`
+through a liquidity-less pool), owner-only
 setters with events, ownership transfer, exact-input buy and sell, exact-output swaps, one event per
 swap, block number topic, anchor read through a StateView-like contract against a second live pool,
 anchor pool id routing, negative tick sign extension, reverting/short/code-less anchors reading as
 zero without blocking the swap, clearing the anchor, pause silencing emission while swaps still execute
-and skipping the anchor call, unit tests of `afterSwap` as the manager (fee from the paid side, zero
-fee when nothing was paid, pool id from the key given), no fee/no custody/no claims, factory fee
+and skipping the anchor call, a gas-burning anchor bounded by its stipend at a 300k swap gas limit,
+unit tests of `afterSwap` as the manager (fee from the paid side, zero fee when nothing was paid, the
+recorded pool read whatever key is passed), no fee/no custody/no claims, factory fee
 collect with a zero liquidity change, liquidity removal, and four fuzz tests (exact input, exact
 output, anchor pass-through, access control).
 
@@ -224,7 +254,8 @@ allowance, over-balance revert, absence of mint/burn/owner/pause entry points, s
 matching, and the deploy script's salt mining and deployment called directly.
 
 `test/mocks/` holds `MockERC20`, `Swapper` (an exact-input/exact-output router paying from its own
-balance, native ETH aware), `LiquidityRouter`, and `AnchorView` with three misbehaving anchors.
+balance, native ETH aware), `LiquidityRouter`, and `AnchorView` with four misbehaving anchors, and
+`DustSwapper` (a swap that settles nothing, for the forged-record test).
 `test/floor/OwnerChecks.sol` asserts an owned contract's owner is neither the factory nor the launch wallet.
 
 ## Deploy script
